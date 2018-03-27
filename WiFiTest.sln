@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 14
+VisualStudioVersion = 14.0.25420.1
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WiFiTest", "WiFiTest\WiFiTest.csproj", "{FBC48647-838C-438E-8AA2-D3F2D8D36191}"
+	ProjectSection(ProjectDependencies) = postProject
+		{BF24194B-6F36-4278-BAA9-8D7A53007F18} = {BF24194B-6F36-4278-BAA9-8D7A53007F18}
+	EndProjectSection
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NWiFi", "NWiFi\NWiFi.csproj", "{BF24194B-6F36-4278-BAA9-8D7A53007F18}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FBC48647-838C-438E-8AA2-D3F2D8D36191}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FBC48647-838C-438E-8AA2-D3F2D8D36191}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FBC48647-838C-438E-8AA2-D3F2D8D36191}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FBC48647-838C-438E-8AA2-D3F2D8D36191}.Release|Any CPU.Build.0 = Release|Any CPU
+		{BF24194B-6F36-4278-BAA9-8D7A53007F18}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BF24194B-6F36-4278-BAA9-8D7A53007F18}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BF24194B-6F36-4278-BAA9-8D7A53007F18}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BF24194B-6F36-4278-BAA9-8D7A53007F18}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

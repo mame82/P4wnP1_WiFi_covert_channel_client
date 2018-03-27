@@ -18,7 +18,8 @@ namespace WiFiTest
             Console.WriteLine(String.Format("Chk1: {0}", NWiFi.Packet2.simpleChecksum8(test1)));
             Console.WriteLine(String.Format("Chk2: {0}", NWiFi.Packet2.simpleChecksum8(test2)));
             */
-            NWiFi.NativeWifi.test();
+            NWiFi.NativeWifi.run();
+            Console.WriteLine("Library exitted");
             Console.Read();
         }
     }

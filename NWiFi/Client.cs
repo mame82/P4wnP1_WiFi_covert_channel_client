@@ -1,13 +1,10 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
-using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Text;
+
 using System.Threading;
-using System.Threading.Tasks;
+
 
 /*
  * Info:
@@ -72,11 +69,13 @@ namespace NWiFi
     {
         public int Limit { get; set; }
         private AutoResetEvent dataPoppedSignal;
+        private AutoResetEvent dataPushedSignal;
 
         public LimitedQueue(int limit): base(limit)
         {
             Limit = limit;
             dataPoppedSignal = new AutoResetEvent(true);
+            dataPushedSignal = new AutoResetEvent(false);
         }
 
         //Note: override of Enqueue not possible, as not virtual
@@ -88,13 +87,20 @@ namespace NWiFi
                 this.dataPoppedSignal.WaitOne();
             }
             base.Enqueue(item);
+            this.dataPushedSignal.Set();
+        }
+
+        public void waitForData()
+        {
+            while (Count == 0) this.dataPushedSignal.WaitOne();
         }
 
         public T pop()
         {
             //Signal pop
+            T data = base.Dequeue();
             this.dataPoppedSignal.Set();
-            return base.Dequeue();
+            return data;
         }
 
     }
@@ -153,7 +159,7 @@ namespace NWiFi
     }
 
 
-    public class Packet2:IEquatable<Packet2>
+    public class Packet2 //:IEquatable<Packet2>
     {
         public byte[] sa = null; //80211 SA
         public byte[] da = null; //80211 DA
@@ -183,6 +189,7 @@ namespace NWiFi
         public const byte CTLM_TYPE_CON_INIT_REQ2 = 3;
         public const byte CTLM_TYPE_CON_INIT_RSP2 = 4;
         public const byte CTLM_TYPE_CON_RESET = 5;
+        public const byte CTLM_TYPE_CON_RESET_RESP = 6;
 
         public const byte PAY1_MAX_LEN = 28;
         public const byte PAY2_MAX_LEN = 236;
@@ -419,6 +426,7 @@ namespace NWiFi
             return (byte)~sum;
         }
 
+        /*
         public bool Equals(Packet2 other)
         {
             //we exclude SA and DA from comparison, as they could change during scans (Probing)
@@ -438,6 +446,7 @@ namespace NWiFi
 
             return true;
         }
+        */
     }
 
     public enum SocketState
@@ -486,6 +495,11 @@ namespace NWiFi
         {
             this.out_queue = new LimitedQueue<byte[]>(40); //The queue holds item, which fit into a single packet ... the limit yould be seen as "maximum pending out packets"
             this.in_queue = new LimitedQueue<byte[]>(10);
+        }
+
+        private void onDisconnect()
+        {
+            Console.WriteLine("Connection reset from server");
         }
 
         public bool Connect(IntPtr nativeWiFiClientHandle, Guid if_guid, byte srvID = 8)
@@ -680,7 +694,7 @@ namespace NWiFi
 
             while (true)
             {
-                
+                Console.WriteLine("=========== SCAN ====================");
                 Packet2[] resps = NativeWifi.SendRecv(handle, this.if_guid, req, true); 
                 if (resps == null)
                 {
@@ -741,34 +755,47 @@ namespace NWiFi
                         //Additionally empty payloads (heartbeat) should be ignored, but we push at least one empty payload to the queue if it arrives, to indicate a EOF (or end of transmission) for the Receive() method
 
                         //check if limit of inqueue reached
-                        if (this.in_queue.Count < this.in_queue.Limit)
+                        if (resp.FlagControlMessage)
                         {
-                            // Queue could take data, so we could acknowledge reception to server
-                            req.ack = resp.seq;
+                            //CTLM
+                            if (resp.ctlm_type == Packet2.CTLM_TYPE_CON_RESET) this.onDisconnect();
+                            //don't advance ack for next request
+                        }
 
-                            //reconstruct payload
-                            int indata_len = resp.pay1.Length;
-                            if (resp.pay2 != null) indata_len += resp.pay2.Length;
-                            byte[] indata = new byte[indata_len];
-                            Buffer.BlockCopy(resp.pay1, 0, indata, 0, resp.pay1.Length);
-                            if (resp.pay2 != null) Buffer.BlockCopy(resp.pay2, 0, indata, resp.pay1.Length, resp.pay2.Length);
+                        else if (this.state == SocketState.STATE_OPEN)
+                        {
+                            if (this.in_queue.Count < this.in_queue.Limit)
+                            {
 
-                            if (indata_len > 0) indata_in_last_run = true; //reset in outer loop, to influence re-scan delay
-                            else indata_in_last_run = false;
 
-                            //enqueue
-                            this.in_queue.push(indata);
 
-                            
+                                // Queue could take data, so we could acknowledge reception to server
+                                req.ack = resp.seq;
+
+                                //reconstruct payload
+                                int indata_len = resp.pay1.Length;
+                                if (resp.pay2 != null) indata_len += resp.pay2.Length;
+                                byte[] indata = new byte[indata_len];
+                                Buffer.BlockCopy(resp.pay1, 0, indata, 0, resp.pay1.Length);
+                                if (resp.pay2 != null) Buffer.BlockCopy(resp.pay2, 0, indata, resp.pay1.Length, resp.pay2.Length);
+
+                                if (indata_len > 0) indata_in_last_run = true; //reset in outer loop, to influence re-scan delay
+                                else indata_in_last_run = false;
+
+                                //enqueue
+                                this.in_queue.push(indata);
+
+                            }
+#if DEBUG
+                            else Console.WriteLine(String.Format("Inqueue limit {0} reached, data needs to be popped to receive", this.in_queue.Limit));
+#endif
                         }
 #if DEBUG
-                        else Console.WriteLine(String.Format("Inqueue limit {0} reached, data needs to be popped to receive", this.in_queue.Limit));
+                        else Console.WriteLine("Packet ignored, because socket not in OPEN state");
 #endif
 
-
-                        Console.WriteLine("=========== SCAN ====================");
                         //Check if there was indata in last scan, if yes -> delay new scan to allow data processing in another thread
-                        if (indata_in_last_run)
+                        if (indata_in_last_run && (this.out_queue.Count == 0))
                         {
                             //Add a delay, to allow another thread to process inbound data, otherwise we would enter the next scan interval
                             //without any chance of processing the data to have an "reply" ready
@@ -817,7 +844,7 @@ namespace NWiFi
             return false;
         }
 
-        public int Receive(byte[] buffer)
+        public int Receive(byte[] buffer, bool blocking=true)
         {
             //the buffer has to have a minimum size of MTU
             //socket has to be in connect state
@@ -825,7 +852,9 @@ namespace NWiFi
             if (!Connected) return -1;
             if (buffer == null) return -2;
             //ToDo: Remove after testing
-            if (buffer.Length < this.MTU) return -3;
+            //if (buffer.Length < this.MTU) return -3;
+
+            if (blocking) this.in_queue.waitForData();
 
             if (this.in_queue.Count == 0) return 0;
 
@@ -857,7 +886,7 @@ namespace NWiFi
             return len_received;
         }
 
-        public int Send(byte[] buffer, int size)
+        public int Send(byte[] buffer, int size, bool aggregate=false)
         {
             //Note: empty buffer is never pushed to outdata
 
@@ -870,16 +899,32 @@ namespace NWiFi
             {
                 int len = Math.Min(this.MTU, size - off);
                 byte[] chunk = Helper.subArray(buffer, off, len);
-                pushOutboundData(chunk);
+                pushOutboundData(chunk, aggregate);
                 outcount += len;
             }
             
             return outcount;
         }
 
-        private void pushOutboundData(byte[] data)
+        private void pushOutboundData(byte[] data, bool aggregate=false)
         {
             this.out_queue.push(data);
+            
+            if(aggregate)
+            {
+                //ToDo: outqueue has to be locked during whole operation
+                byte[][] copy = this.out_queue.ToArray();
+                List<byte> aggregation = new List<byte>();
+                this.out_queue.Clear();
+
+                //Aggregate
+                foreach (byte[] bytes in copy) aggregation.AddRange(bytes);
+
+                //pop chunks from aggregation and push them back to queque via send
+                byte[] all = aggregation.ToArray();
+                this.Send(all, all.Length, false);
+
+            }
 
 #if DEBUG
             Console.WriteLine(String.Format("Out queue elements: {0}", this.out_queue.Count));
@@ -1404,10 +1449,10 @@ namespace NWiFi
 
             private void out_handler(object proc, DataReceivedEventArgs data_args)
             {
-                String outstr = data_args.Data;
-                byte[] outbytes = System.Text.Encoding.UTF8.GetBytes(outstr);
+                String outstr = data_args.Data + "\n"; //data receives line-wise, we add back in a linefeed, as it everything gets accumulated to MTU size before sending
+                byte[] outbytes = System.Text.Encoding.UTF8.GetBytes(outstr); 
                 Console.WriteLine(String.Format("Proc data to socket: {0}", outstr));
-                csock.Send(outbytes, outbytes.Length);
+                csock.Send(outbytes, outbytes.Length, true);
             }
 
             public bool bind()
@@ -1433,7 +1478,7 @@ namespace NWiFi
                 {
                     String instr = "";
                     //if socket has input, read it and write to proc stdin
-                    while (csock.hasInData())
+                    //while (csock.hasInData())
                     {
                         rcv_len = csock.Receive(sock_in_buf);
                         if (rcv_len > 0)
@@ -1520,7 +1565,7 @@ namespace NWiFi
                     
 
                     
-                    if (wsock.hasInData())
+       //             if (wsock.hasInData())
                     {
                         int rcv_len = wsock.Receive(rcvbuf);
 

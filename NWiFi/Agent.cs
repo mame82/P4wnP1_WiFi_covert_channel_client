@@ -1472,10 +1472,18 @@ namespace NWiFi
             while (pos < (lenIeData - 2))
             {
                 //read type + length of current ie
-                ie_type = Marshal.ReadByte(pIeData, pos);
-                pos++;
-                ie_len = Marshal.ReadByte(pIeData, pos);
-                pos++;
+                try
+                {
+                    ie_type = Marshal.ReadByte(pIeData, pos);
+                    pos++;
+                    ie_len = Marshal.ReadByte(pIeData, pos);
+                    pos++;
+                }
+                catch (System.AccessViolationException)
+                {
+                    Console.WriteLine(String.Format("Access violation in extractIe for IE type {0}", searched_ie_type));
+                    return result;
+                }
 
                 //check if searched type
                 if (ie_type == searched_ie_type)
@@ -1587,7 +1595,9 @@ namespace NWiFi
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     RedirectStandardInput = true,
-                    UseShellExecute = false
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                    
                 };
                 this.proc = new Process { StartInfo = this.psi };
                 proc.OutputDataReceived += new DataReceivedEventHandler(this.out_handler);
@@ -1711,23 +1721,23 @@ namespace NWiFi
         }
 
         
-
+/*
 #if DEBUG
         [DllImport("kernel32")]
         static extern bool AllocConsole();
 #endif
-
-        public static void run()
+*/
+        public static void run(int con_attempts=-1, byte srvID=9)
         {
 #if DEBUG
-            AllocConsole();
+//            AllocConsole();
 
             Console.WriteLine("Starting test");
 #endif
             bool retry = true;
             while (retry)
             {
-                int ex_code = connectAndBindProc(-1, 9); //listen on server ID 9, endless connection attempts
+                int ex_code = connectAndBindProc(con_attempts, srvID); //listen on server ID 9, endless connection attempts
                 Console.WriteLine(String.Format("Process died with exit code: {0}", ex_code));
                 if (ex_code == -5) break;
             }

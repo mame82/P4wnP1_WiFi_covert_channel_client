@@ -1,86 +1,29 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-
-using System.Threading;
-
-
-/*
- * Info:
- * - Flow control / Communications / Protocol
- *      - the upstream channel of the system under test (target) are probe requests with data encoded in the IE for SSID
- *      and in a vendor specific IE (the latter only if apllicable, protocol tests for arival of vendor IE during connection initialization)
- *      - The downstream channel to the target are probe replies. Beacons aren't used, to keep the channel "more silent", otherwise
- *      the SSID encoded data would be shown on other devices scanning for WiFi networks.
- *      - As the probe requests are issued using scans, they arrive on all 802.11 WiFi frequencies (of the regulatory). This means the implementation is
- *      independent of the WiFi channel in use, covert channel server and target could work on different WiFi channels. 
- *      Additionally, this allows covert channel communication in both cases: 
- *          A) the target is already connected to a WiFi network (even if the 802.11 frequency differs from the one of the server)
- *          B) the target isn't connected to a WiFi network at all
- *      - no high privileges (administrator) are needed to issue scans.
- *      - Probe responses are accepted by the Windows WiFi API (spotted networks are added to the BSS list), even if the SSID doesn't fit the one from the 
- *      probe request. This allows encoding data in the SSID of the probe response, which differs from the SSID encoded data in the probe request.
- *      - As no beacons are used, the server isn't able to actively send data (which could only be seen by the target if scans are issued in high frequencies, anyway).
- *      This means the communication follows a REQUEST-REPLY-SCHEME on the lower layer, where the requests are issued by the target.
- *      - This low level REQUEST-REPLY transfer is constantly happening, by forcing the target to do active scans as fast as possible (could be throttled
- *      in future implementations, to account for more covertness and power saving on mobile targets). Due to the constant data flow, the upper
- *      layer has a permanent data carrier, which is available, as long as the target is in range and the covert channel payload is running.
- *      - A single scan period takes 4 seconds (for Wireless network drivers that meet Windows logo requirements). This means the round trip time is
- *      4 seconds, if the probe responses arrive in timely manner (before the interface hops to the next 802.11 channel during WiFi scan). If the (dynamically 
- *      generated) probe response doesn't arrive in time, the round trip time doubles.
- *      - Current implementation of the Windows Native WiFi 'WlanScan' function, allows active scanning for  a single SSID per scan. This means, sending
- *      multiple probe requests with encoded data during a single scan isn't possible. This has a huge impact on throughput of the channel (upstream)
- *      as only one data packet is "in flight" at any given time. On the other hand, this greatly simplifies the flow control, as for every sequence number
- *      an ack has to be received, before the next packet is send. For the downstream, it should be posibble to send multiple probe responses an use a Sliding
- *      Window approach to account for packet loss with multiple packets in flight. The latter is out-of-scope for this PoC, although the current protocol uses
- *      SEQuence and ACKnowledge numbers between 0 and 15 and thus is prepared for flow control improvements (On Windows 10, active scanning for multiple SSIDs
- *      at once seems to be possible with another API).
- *      - To keep the round trip time short, dynamically generated probe responses have to be delivered as fast as possible for relevant probe requests, by the server.
- *      This is achieve by further modifications on the firmware and driver stack of the BCM43430a1 SoC of a Raspberry Pi Zero, utilizing nexmon.
- *      First, the brcmfmac driver has been modified to listen for PROBE_REQUEST events, which are genrated in the firmware by default. A netlink multicast socket
- *      is used to propagate these events back from kernelspace to userspace. Additionally the firmware has been modified, to receive unicast netlink based IOCTLs which
- *      are used to push the data for the needed PROBE RESPONSES to the firmware. The firmware than creates and delivers these probe responses through the radio.
- *      Due to this approach, there's no Access Point setup needed to bring up the covert channel server. 
- *      In userland, python is used to interface with the two netlink sockets and do the backend work. The unoptimized PoC reaches response time (from probe request to probe response)
- *      roughly below 100ms, which is enough for the scan period on a single channel (nearly every probe requests receives a proper response). No tests have been done in crowded area.
- *      - The communication protocol additionally introduces the concept of client and server IDs, to identify communication partners. This approach was chosen, because the
- *      802.11 Source Address (SA) of a WiFi client could change during scans (especially on mobile devices). The IDs for clients and servers could be compared to IP addresses
- *      in the IP-Stack, but are limited to 16 (per client and per server).
- *      - Due to the protocols independency of 802.11 BSSID, SA and DA, these addresses could be changed during ongoing communications (for example to line-up with unmalicious devices
- *      and cloak the communication even further).
- *      - As the covert channel deoesn't depend on a constant 802.11 frequency, 802.11 channel hopping of the server should be possible. This hasn't been tested, but
- *      would it make even harder to monitor the covert channel communication.
- *      - Noise (non covert channel communication) is filtered by a simple approach: The SSID of covert channel frames, always has the maximum length (32 bytes), and the 
- *      last byte is the complement of a 8-bit checksum (complement to avoid all zero SSID). If possible an additional vendor IE, 238 bytes in length, is added and prepended
- *      with a checksum, too.
- *      - In summary, the protocol handles up to 16 clients, doesn't depend on a deciated 802.11 WiFi channel, isn't visible for other WiFi clients and reaches a rough througput
- *      of 260 bytes/4 seconds. With some extensions it could allow channel hopping and encryption, to circumvent easy monitoring. The Windows payload doesn't need a privileged user.
- *      As this is a PoC, no opimization have been done, nor is it tested for robustness in crowded areas. Scanning for networks in high frequency, doesn't interrupt active WiFi connections
- *      of the target, but impacts throughput of valid communication (the radio has to switch channels for scanning, while keeping comms on a single channel alive)
- *      
+﻿/*
  * 
+ * This file is part of P4wnP1.
+ * 
+ * Copyright (c) 2018, Marcus Mengs. 
+ * 
+ * P4wnP1 is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * P4wnP1 is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License
+ * along with P4wnP1.  If not, see <http://www.gnu.org/licenses/>.
  * 
  */
 
-/*
-* - only one channel per client
-* - client identified by SA (could change during scan, e.g. apple) --> Failover to payload based identifier needed
-* - MTU depends on usability of Vendor IE in each direction, which should be tested on connection init
-* - transfer rate client --> server depends on scan speed (new scan only if old one is finished)
-* ---> native wifi api doesn't allow scanning for multiple SSIDs at once, could be improved with new Win10 API
-* - packet transmission, transmit order and uniqeness aren't guarantied at low layer for now (UDP like)
-* - covert channel data is distinguished from noise with 16 bit checksums (one for SSID and one for Vendor IE)
-* - source MAC of server could vary (isn't used in covert channel data validation), this could be used to randomize
-* the server's source mac (=bssid and SA), e.g. to prevent alerts from monitoring systems which react on changing
-* SSIDs for the same BSSID
-* - it should be noted, that the covert channel isn't impacted by active counter meassures based on
-* on detection of multiple SSIDs for the same AP bssid (for instance PiHunter would start sending de-auths when
-* this kind of management frames is spotted). This wouldn't affect the covert channel, because it isn't based on
-* authentication or association, but on purew PROBE REQUEST/RESPONSE. Due to this fact, a de-auth would do nothing.
-* To be more precise, the P4wnP1 end would even ignore the de-auth, as it only reacts on probe requests.
-* 
-*/
+
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace NWiFi
 {
@@ -1720,18 +1663,9 @@ namespace NWiFi
             return connection_exit_code;
         }
 
-        
-/*
-#if DEBUG
-        [DllImport("kernel32")]
-        static extern bool AllocConsole();
-#endif
-*/
         public static void run(int con_attempts=-1, byte srvID=9)
         {
 #if DEBUG
-//            AllocConsole();
-
             Console.WriteLine("Starting test");
 #endif
             bool retry = true;
